@@ -11,8 +11,7 @@ import time
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.protocol import receive_tcp_message, unpack_str, send_tcp_message, pack_str
 
-HOST = '0.0.0.0'
-PORT = 5000
+HOST, PORT = '0.0.0.0', 5000
 DISCOVERY_PORT = 5001 # Puerto del radar UDP
 MAX_PLAYERS = 100
 SERVER_NAME = "CC8-Server VAEB"
@@ -21,6 +20,8 @@ SERVER_NAME = "CC8-Server VAEB"
 STATE_WAITING = 0x01
 STATE_STARTING = 0x02
 STATE_RUNNING = 0x03
+
+DIR_NONE, DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT = 0, 1, 2, 3, 4
 
 # Constantes del juego
 MAP_SIZE = 2000
@@ -76,27 +77,27 @@ def start_server():
     # Variables de control de la partida
     server_state = STATE_WAITING
     countdown_seconds = 5
-    last_countdown_time = 0
+    last_time = 0
+    last_tick_time = 0
     
     print(f"Servidor en estado WAITING...")
     print(f" - Partida TCP en puerto {PORT}")
     print("[INFO] Presiona 'Enter' en esta consola para iniciar la partida.")
     
     while True:
-
+        current_time = time.time()
         # EVENTO A: Gatillo del anfitrión
         if server_state == STATE_WAITING and msvcrt.kbhit():
             tecla = msvcrt.getch()
             if tecla in (b'\r', b'\n'):
                 print("\n[!] ¡Iniciando secuencia de arranque! Cerrando puertas...")
                 server_state = STATE_STARTING # Cambiamos de estado
-                last_countdown_time = time.time()
+                last_time = time.time()
 
         # EVENTO B: Motor de cuenta regresiva
         if server_state == STATE_STARTING:
-            current_time = time.time()
-            if current_time - last_countdown_time >= 1.0: # Pasó 1 segundo exacto
-                last_countdown_time = current_time
+            if current_time - last_time >= 1.0: # Pasó 1 segundo exacto
+                last_time = current_time
                 
                 # Armamos el paquete GAME_COUNTDOWN (0x23)
                 # Formato: u8 secondsRemaining
@@ -111,14 +112,15 @@ def start_server():
 
                 if countdown_seconds < 0:
                     server_state = STATE_RUNNING
-                    
-                    # 1. Calcular posiciones iniciales polares (fuera del círculo)
+                    last_tick_time = current_time
                     dist = CIRCLE_RADIUS + SPAWN_MARGIN
+
+                    # 1. Calcular posiciones iniciales polares (fuera del círculo)
                     for client in clients.values():
                         angulo = random.uniform(0, 2 * math.pi)
-                        client['x'] = dist * math.cos(angulo)
-                        client['y'] = dist * math.sin(angulo)
-                        client['direction'] = 0x00 # NONE
+                        client['x'] = (MAP_SIZE / 2) + (dist * math.cos(angulo))
+                        client['y'] = (MAP_SIZE / 2) + (dist * math.sin(angulo))
+                        client['direction'] = DIR_NONE
                         client['hasFlag'] = False
                         
                     # 2. Empaquetar la cabecera geométrica del juego (GAME_STARTED - 0x24)
@@ -157,8 +159,42 @@ def start_server():
                     # 5. Broadcast final: ¡Empieza la partida!
                     for sock in clients.keys():
                         send_tcp_message(sock, 0x24, bytes(payload))
-                    print("\n[!] Partida iniciada. (El servidor se detendrá por ahora en esta prueba).")
-                    return # Termina la prueba temporalmente
+                    print("\n[!] ¡Partida en curso! Procesando inputs...")
+
+        # EVENTO C: Motor Principal del Juego (50ms) ---
+        if server_state == STATE_RUNNING:
+            if current_time - last_tick_time >= (TICK_INTERVAL_MS / 1000.0):
+                last_tick_time = current_time
+                
+                # 1. Calcular físicas de movimiento
+                delta_t = TICK_INTERVAL_MS / 1000.0
+                distancia = PLAYER_SPEED * delta_t # Píxeles a mover en este frame
+                
+                for client in clients.values():
+                    if client['direction'] == DIR_UP: client['y'] -= distancia
+                    elif client['direction'] == DIR_DOWN: client['y'] += distancia
+                    elif client['direction'] == DIR_LEFT: client['x'] -= distancia
+                    elif client['direction'] == DIR_RIGHT: client['x'] += distancia
+                    
+                    # Evitar que se salgan del mapa (0 a 2000)
+                    client['x'] = max(0, min(MAP_SIZE, client['x']))
+                    client['y'] = max(0, min(MAP_SIZE, client['y']))
+
+                # 2. Empaquetar y enviar GAME_STATE (0x25)
+                # payload: u8 flag_status, u16 flag_carrier, i32 flag_x, i32 flag_y, u8 count
+
+                payload = bytearray()
+                payload.extend(struct.pack('>BHiiB', 0x01, 0, 0, 0, len(clients)))
+
+                for client in clients.values():
+                    # u16 id, i32 x, i32 y, u8 dir, i8 hasFlag
+                    payload.extend(struct.pack('>HiiBb',
+                        client['playerId'], int(round(client['x'] * 100)), int(round(client['y'] * 100)),
+                        client['direction'], client['hasFlag']
+                    ))
+                    
+                for sock in clients.keys():
+                    send_tcp_message(sock, 0x25, bytes(payload))
 
         # EVENTOS DE RED:
         # select() vigila quién tiene mensajes listos para leer
@@ -167,7 +203,7 @@ def start_server():
         # Sockets listos para que se les envíe algo (aquí se ignora con un _).
         # Sockets que sufrieron un error fatal o crítico (exception_sockets).
 
-        read_sockets, _, exception_sockets = select.select(sockets_list, [], sockets_list, 0.05)
+        read_sockets, _, exception_sockets = select.select(sockets_list, [], sockets_list, 0.005)
         
         for notified_socket in read_sockets:
             # EVENTO A: Alguien buscó servidores por el radar UDP
@@ -175,7 +211,7 @@ def start_server():
                 try:
                     data, client_address = udp_socket.recvfrom(1024)
                     # Validamos el DISCOVER_REQUEST (0x01)
-                    if len(data) >= 2 and data[0] == 0x01 and data[1] == 3:
+                    if data[0] == 0x01 and server_state == STATE_WAITING:
                         # Armar DISCOVER_RESPONSE (0x02)
                         tipo_ver = struct.pack('>BB', 0x02, 3)
                         game_id_pack = struct.pack('>H', game_id)
@@ -189,7 +225,7 @@ def start_server():
                     pass
 
             #EVENTO B: Nueva conexión TCP
-            elif notified_socket == server_socket:
+            elif notified_socket == server_socket and server_state == STATE_WAITING:
                 client_socket, client_address = server_socket.accept()
                 client_socket.setblocking(False)
                 sockets_list.append(client_socket)
@@ -206,11 +242,9 @@ def start_server():
                 if msg_type is None:
                     sockets_list.remove(notified_socket)
                     del clients[notified_socket]
-                    broadcast_lobby_state(clients) # Avisa que alguien se fue
-                    continue
-                    
+
                 # Mensaje JOIN (0x10)
-                if msg_type == 0x10: 
+                elif msg_type == 0x10: 
                     player_name, _ = unpack_str(payload)
                     clients[notified_socket]["name"] = player_name
                     p_id = clients[notified_socket]["playerId"]
@@ -222,6 +256,10 @@ def start_server():
 
                     # Avisa a todos que entró alguien nuevo
                     broadcast_lobby_state(clients)
+
+                elif msg_type == 0x11: # INPUT RECIBIDO 
+                    direccion = struct.unpack('>B', payload)[0]
+                    clients[notified_socket]["direction"] = direccion
 
         # Limpieza de errores
         # Garantiza que si un cliente se sale, el servidor simplemente barre los restos 
