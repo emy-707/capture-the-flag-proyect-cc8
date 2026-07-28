@@ -17,10 +17,11 @@ def discover_servers():
     
     # Paquete DISCOVER_REQUEST: tipo 0x01
     request_packet = struct.pack('>BB', 0x01, 3)
+        
     try:
         udp_socket.sendto(request_packet, ('255.255.255.255', DISCOVERY_PORT))
     except Exception as e:
-        print(f"Error UDP: {e}")
+        print(f"Error al enviar broadcast: {e}")
         return []
 
     servers = []
@@ -49,7 +50,7 @@ def discover_servers():
 def start_client():
     available_servers = discover_servers()
     if not available_servers:
-        print("No se encontraron servidores. Asegúrate de encender el servidor primero.")
+        print("No se encontraron servidores. ")
         return
         
     print("\n--- SERVIDORES ENCONTRADOS ---")
@@ -66,29 +67,54 @@ def start_client():
     join_payload = pack_str("Jugador")
     send_tcp_message(client_socket, 0x10, join_payload)
 
-    print("Esperando eventos de la sala (Presiona Ctrl+C para salir)...")
+    print("Esperando inicio de la partida... (Presiona Ctrl+C para salir)")
+    game_data = None
     try:
         while True:
             msg_type, payload = receive_tcp_message(client_socket)
             if msg_type is None: continue
             
-            if msg_type == 0x20: # JOIN_ACCEPTED
-                my_player_id = struct.unpack('>HH', payload)[0]
-                print(f"¡Éxito! Mi ID oficial es: P{my_player_id:02d}")
+            if msg_type == 0x22: # LOBBY_STATE
+                print(" -> Actualización de sala recibida.")
                 
-            elif msg_type == 0x22: # LOBBY_STATE
+            elif msg_type == 0x23: # GAME_COUNTDOWN
+                seconds_left = struct.unpack('>B', payload)[0]
+                if seconds_left > 0:
+                    print(f">>> La partida inicia en {seconds_left}...")
+                else:
+                    print(">>> ¡Preparando entorno gráfico!")
+
+            elif msg_type == 0x24: # GAME_STARTED
+                print("\n[!] ¡Paquete GAME_STARTED recibido! Desempaquetando variables...")
                 offset = 0
-                state, count = struct.unpack_from('>BB', payload, offset)
-                offset += 2
-                print(f"\n--- ACTUALIZACIÓN DE SALA ({count} JUGADORES) ---")
-                for _ in range(count):
+                
+                # Lee las variables base (i32 x5, u16 x1)
+                m_size, c_rad, p_rad, p_speed, int_rad, tick = struct.unpack_from('>iiiiiH', payload, offset)
+                offset += 22
+                
+                print(f" -> Mapa: {m_size/100}x{m_size/100}, Radio círculo: {c_rad/100}")
+                print(f" -> Velocidad: {p_speed/100} u/s, Tick: {tick}ms")
+                
+                f_status, f_carrier, f_x, f_y = struct.unpack_from('>BHii', payload, offset)
+                offset += 11
+                
+                p_count = struct.unpack_from('>B', payload, offset)[0]
+                offset += 1
+                
+                print(f" -> Jugadores inicializados: {p_count}")
+                for _ in range(p_count):
                     p_id = struct.unpack_from('>H', payload, offset)[0]
                     offset += 2
                     p_name, offset = unpack_str(payload, offset)
-                    print(f" -> P{p_id:02d}: {p_name}")
-                    
+                    p_x, p_y, p_dir, p_flag = struct.unpack_from('>iiBb', payload, offset)
+                    offset += 10
+                    print(f"    - P{p_id:02d} ({p_name}) spawneado en ({p_x/100:.1f}, {p_y/100:.1f})")
+                
+                print("\nSetup completado. Listo para pasarle el control al Motor Gráfico.")
+                break # Rompe el bucle TCP puro
     except KeyboardInterrupt:
         print("\nSaliendo...")
+        pass
         client_socket.close()
 
 if __name__ == "__main__":
