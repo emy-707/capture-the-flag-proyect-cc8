@@ -23,6 +23,9 @@ STATE_RUNNING = 0x03
 
 DIR_NONE, DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT = 0, 1, 2, 3, 4
 
+# Estados posibles de la bandera
+FLAG_AVAILABLE, FLAG_CARRIED, FLAG_OUTSIDE = 0x01, 0x02, 0x03
+
 # Constantes del juego
 MAP_SIZE = 2000
 CIRCLE_RADIUS = 500
@@ -79,6 +82,12 @@ def start_server():
     countdown_seconds = 5
     last_time = 0
     last_tick_time = 0
+
+    # Variables de control de la bandera
+    flag_status = FLAG_AVAILABLE
+    flag_carrier = 0
+    flag_x = MAP_SIZE / 2  # Arranca en el centro exacto del mapa
+    flag_y = MAP_SIZE / 2
     
     print(f"Servidor en estado WAITING...")
     print(f" - Partida TCP en puerto {PORT}")
@@ -135,9 +144,17 @@ def start_server():
                         TICK_INTERVAL_MS
                     ))
                     
+                    # reinicio de la bandera al centro del mapa para la nueva ronda
+                    flag_status = FLAG_AVAILABLE
+                    flag_carrier = 0
+                    flag_x = MAP_SIZE / 2
+                    flag_y = MAP_SIZE / 2
+
                     # 3. Estado inicial de la bandera en (0,0)
                     # u8 estado(0x01=AVAILABLE), u16 dueño, i32 X, i32 Y
-                    payload.extend(struct.pack('>BHii', 0x01, 0, 0, 0))
+                    payload.extend(struct.pack('>BHii', flag_status, flag_carrier,
+                        int(round(flag_x * 100)), int(round(flag_y * 100))
+                    ))
                     
                     # 4. Lista de Jugadores
                     payload.extend(struct.pack('>B', len(clients))) # u8 count
@@ -180,11 +197,32 @@ def start_server():
                     client['x'] = max(0, min(MAP_SIZE, client['x']))
                     client['y'] = max(0, min(MAP_SIZE, client['y']))
 
+                # Si alguien lleva la bandera, ésta viaja pegada a su portador
+                juego_termino = False
+                if flag_status == FLAG_CARRIED:
+                    for client in clients.values():
+                        if client.get('hasFlag', False):
+                            flag_x = client['x']
+                            flag_y = client['y']
+
+                            # El centro real del mapa es (MAP_SIZE/2, MAP_SIZE/2)
+                            distancia_centro = math.hypot(flag_x - (MAP_SIZE / 2), flag_y - (MAP_SIZE / 2))
+                            if distancia_centro > CIRCLE_RADIUS:
+                                p_id = client['playerId']
+                                nombre_ganador = client.get('name', f"Jugador_{p_id}")
+                                print(f"\n[!] ¡FIN DEL JUEGO! El jugador P{p_id} ({nombre_ganador}) sacó la bandera del círculo y GANÓ.")
+
+                                flag_status = FLAG_OUTSIDE
+                                juego_termino = True
+                            break
+
                 # 2. Empaquetar y enviar GAME_STATE (0x25)
                 # payload: u8 flag_status, u16 flag_carrier, i32 flag_x, i32 flag_y, u8 count
 
                 payload = bytearray()
-                payload.extend(struct.pack('>BHiiB', 0x01, 0, 0, 0, len(clients)))
+                payload.extend(struct.pack('>BHiiB', flag_status, flag_carrier,
+                    int(round(flag_x * 100)), int(round(flag_y * 100)), len(clients)
+                ))
 
                 for client in clients.values():
                     # u16 id, i32 x, i32 y, u8 dir, i8 hasFlag
@@ -195,6 +233,23 @@ def start_server():
                     
                 for sock in clients.keys():
                     send_tcp_message(sock, 0x25, bytes(payload))
+
+                # Si la ronda terminó, avisa con GAME_OVER (0x29) y vuelve a WAITING
+                if juego_termino:
+                    # Formato: u16 versión, u16 winnerPlayerId, str winnerName, u8 indicador final
+                    game_over_payload = bytearray()
+                    game_over_payload.extend(struct.pack('>H', 0x03))
+                    game_over_payload.extend(struct.pack('>H', p_id))
+                    game_over_payload.extend(pack_str(nombre_ganador))
+                    game_over_payload.extend(struct.pack('>B', 0x04))
+
+                    for sock in clients.keys():
+                        send_tcp_message(sock, 0x29, bytes(game_over_payload))
+
+                    # Reinicia la sala para permitir una nueva ronda
+                    server_state = STATE_WAITING
+                    countdown_seconds = 5
+                    broadcast_lobby_state(clients)
 
         # EVENTOS DE RED:
         # select() vigila quién tiene mensajes listos para leer
@@ -225,14 +280,19 @@ def start_server():
                     pass
 
             #EVENTO B: Nueva conexión TCP
-            elif notified_socket == server_socket and server_state == STATE_WAITING:
+            elif notified_socket == server_socket:
                 client_socket, client_address = server_socket.accept()
-                client_socket.setblocking(False)
-                sockets_list.append(client_socket)
-                
-                # Se le asigna un ID interno
-                clients[client_socket] = {"playerId": player_counter}
-                player_counter += 1
+
+                # Si la partida ya arrancó, no se aceptan jugadores nuevos
+                if server_state == STATE_WAITING:
+                    client_socket.setblocking(False)
+                    sockets_list.append(client_socket)
+
+                    # Se le asigna un ID interno
+                    clients[client_socket] = {"playerId": player_counter}
+                    player_counter += 1
+                else:
+                    client_socket.close()
 
             #EVENTO C: Mensajes TCP
             else:
@@ -240,8 +300,20 @@ def start_server():
                 
                 # Desconexión
                 if msg_type is None:
+                    # Si el jugador que se cayó llevaba la bandera, ésta cae al suelo
+                    client_info = clients.get(notified_socket, {})
+                    if client_info.get('hasFlag', False):
+                        flag_status = FLAG_AVAILABLE
+                        flag_carrier = 0
+                        flag_x = client_info['x']
+                        flag_y = client_info['y']
+
                     sockets_list.remove(notified_socket)
                     del clients[notified_socket]
+
+                    # Avisa al resto de la sala si estábamos en WAITING
+                    if server_state == STATE_WAITING:
+                        broadcast_lobby_state(clients)
 
                 # Mensaje JOIN (0x10)
                 elif msg_type == 0x10: 
@@ -249,7 +321,7 @@ def start_server():
                     clients[notified_socket]["name"] = player_name
                     p_id = clients[notified_socket]["playerId"]
                     
-                    # Responder con JOIN_ACCEPTED (0x20)
+                    # Responde con JOIN_ACCEPTED (0x20)
                     # Formato del protocolo: u16 playerId, u16 gameId
                     response_payload = struct.pack('>HH', p_id, game_id)
                     send_tcp_message(notified_socket, 0x20, response_payload)
@@ -261,6 +333,52 @@ def start_server():
                     direccion = struct.unpack('>B', payload)[0]
                     clients[notified_socket]["direction"] = direccion
 
+                # Mensaje INTERACT (0x12) -> capturar o robar la bandera
+                elif msg_type == 0x12:
+                    client = clients[notified_socket]
+                    p_id = client["playerId"]
+
+                    # Caso A: la bandera está libre en el suelo
+                    if flag_status == FLAG_AVAILABLE:
+                        distancia = math.hypot(client['x'] - flag_x, client['y'] - flag_y)
+                        if distancia <= INTERACTION_RADIUS:
+                            print(f"[!] Jugador P{p_id} capturó la bandera.")
+                            flag_status = FLAG_CARRIED
+                            flag_carrier = p_id
+                            client['hasFlag'] = True
+
+                    # Caso B: la bandera la lleva otro jugador -> se la puede robar
+                    elif flag_status == FLAG_CARRIED and flag_carrier != p_id:
+                        distancia = math.hypot(client['x'] - flag_x, client['y'] - flag_y)
+                        if distancia <= INTERACTION_RADIUS:
+                            print(f"[!] Jugador P{p_id} le robó la bandera a P{flag_carrier}.")
+                            for otro in clients.values():
+                                if otro['playerId'] == flag_carrier:
+                                    otro['hasFlag'] = False
+                                    break
+                            flag_carrier = p_id
+                            client['hasFlag'] = True
+
+                # Mensaje LEAVE (0x13) -> desconexión voluntaria
+                elif msg_type == 0x13:
+                    client_info = clients.get(notified_socket, {})
+                    p_id = client_info.get("playerId", "?")
+                    print(f"Cliente P{p_id} abandonó la sala (LEAVE).")
+
+                    # Si llevaba la bandera, cae al suelo en su última posición
+                    if client_info.get('hasFlag', False):
+                        flag_status = FLAG_AVAILABLE
+                        flag_carrier = 0
+                        flag_x = client_info['x']
+                        flag_y = client_info['y']
+
+                    sockets_list.remove(notified_socket)
+                    del clients[notified_socket]
+                    notified_socket.close()
+
+                    if server_state == STATE_WAITING:
+                        broadcast_lobby_state(clients)
+
         # Limpieza de errores
         # Garantiza que si un cliente se sale, el servidor simplemente barre los restos 
         # y sigue funcionando para los demás como si nada hubiera pasado.
@@ -268,6 +386,14 @@ def start_server():
             if notified_socket in sockets_list:
                 sockets_list.remove(notified_socket)
             if notified_socket in clients:
+                # Si el jugador que falló llevaba la bandera, ésta cae al suelo
+                client_info = clients[notified_socket]
+                if client_info.get('hasFlag', False):
+                    flag_status = FLAG_AVAILABLE
+                    flag_carrier = 0
+                    flag_x = client_info['x']
+                    flag_y = client_info['y']
+
                 del clients[notified_socket]
                 broadcast_lobby_state(clients)
 

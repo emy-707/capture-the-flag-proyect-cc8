@@ -75,15 +75,29 @@ def run_game_loop(client_socket, my_id, game_config):
     pygame.display.set_caption(f"Jugador ID: P{my_id:02d}")
     clock = pygame.time.Clock()
 
-    players_data = {} # Guarda la data cruda enviada por el servidor
+    # Fuentes para el nombre de los jugadores y el cartel de victoria
+    font_name = pygame.font.SysFont(None, 20)
+    font_banner = pygame.font.SysFont(None, 48)
+
+    players_data = game_config.get('players', {}) # Guarda la data cruda enviada por el servidor
+    # Estado de la bandera, ya viene armado desde GAME_STARTED
+    flag_data = game_config.get('flag', {'status': 0x01, 'carrierId': 0, 'x': MAP_SIZE / 2, 'y': MAP_SIZE / 2})
     current_direction = DIR_NONE
     running = True
+
+    # Control del cartel de fin de partida
+    game_over = False
+    winner_text = ""
 
     while running:
         # 1. Eventos de Pygame (Cerrar ventana y Teclado)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            # Barra espaciadora -> INTERACT (0x12) para capturar/robar la bandera
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_SPACE:
+                    send_tcp_message(client_socket, 0x12, b'')
                 
         # Lectura de teclas para movimiento
         keys = pygame.key.get_pressed()
@@ -110,13 +124,40 @@ def run_game_loop(client_socket, my_id, game_config):
                 # Desempaquetar cabecera de la bandera y cantidad de jugadores (>BHiiB = 12 bytes)
                 flag_status, flag_carrier, flag_x, flag_y, p_count = struct.unpack_from('>BHiiB', payload, offset)
                 offset += 12 # CORREGIDO: antes era 11
-                
-                players_data.clear()
+
+                # Actualiza el estado de la bandera para dibujarla
+                flag_data['status'] = flag_status
+                flag_data['carrierId'] = flag_carrier
+                flag_data['x'] = flag_x / 100.0
+                flag_data['y'] = flag_y / 100.0
+
+                # Reconstruye la lista conservando el nombre que ya se conocía de cada jugador
+                nuevos_players = {}
                 for _ in range(p_count):
                     # Desempaquetar cada jugador (>HiiBb = 12 bytes)
                     p_id, p_x, p_y, p_dir, p_flag = struct.unpack_from('>HiiBb', payload, offset)
-                    offset += 12 # CORREGIDO: antes era 10
-                    players_data[p_id] = {'x': p_x / 100.0, 'y': p_y / 100.0}
+                    offset += 12
+
+                    nombre_previo = players_data.get(p_id, {}).get('name', f"P{p_id}")
+                    nuevos_players[p_id] = {
+                        'name': nombre_previo,
+                        'x': p_x / 100.0, 'y': p_y / 100.0,
+                        'direction': p_dir, 'hasFlag': bool(p_flag)
+                    }
+                players_data = nuevos_players
+
+            # GAME_OVER (0x29) -> muestra el cartel de victoria
+            elif msg_type == 0x29:
+                offset = 0
+                _version = struct.unpack_from('>H', payload, offset)[0]
+                offset += 2
+                winner_id = struct.unpack_from('>H', payload, offset)[0]
+                offset += 2
+                winner_name, offset = unpack_str(payload, offset)
+
+                print(f"\n[!] ¡PARTIDA FINALIZADA! El ganador es {winner_name}")
+                game_over = True
+                winner_text = f"¡{winner_name.upper()} GANÓ LA PARTIDA!"
 
         # 3. Dibujar Frame Gráfico
         screen.fill((30, 30, 30)) # Fondo oscuro
@@ -126,15 +167,35 @@ def run_game_loop(client_socket, my_id, game_config):
         radius = int(game_config['circle_radius'] * SCALE)
         pygame.draw.circle(screen, (50, 150, 50), center, radius, 3)
 
-        # Dibujar Jugadores
+        # Dibuja la Bandera (Escalada)
+        flag_pos = (int(flag_data['x'] * SCALE), int(flag_data['y'] * SCALE))
+        pygame.draw.rect(screen, (255, 215, 0), (flag_pos[0] - 6, flag_pos[1] - 6, 12, 12))
+
+        # Dibuja Jugadores
         p_rad = int(game_config['player_radius'] * SCALE)
         for p_id, p_info in players_data.items():
             color = (50, 50, 250) if p_id == my_id else (200, 50, 50)
             p_pos = (int(p_info['x'] * SCALE), int(p_info['y'] * SCALE))
             pygame.draw.circle(screen, color, p_pos, p_rad)
 
+            # Nombre del jugador arriba de su círculo
+            name_surface = font_name.render(p_info.get('name', f"P{p_id}"), True, (255, 255, 255))
+            name_rect = name_surface.get_rect(center=(p_pos[0], p_pos[1] - p_rad - 10))
+            screen.blit(name_surface, name_rect)
+
+        # Cartel de victoria si la partida ya terminó
+        if game_over:
+            text_surf = font_banner.render(winner_text, True, (255, 215, 0))
+            text_rect = text_surf.get_rect(center=(int(MAP_SIZE * SCALE) // 2, int(MAP_SIZE * SCALE) // 2))
+            pygame.draw.rect(screen, (0, 0, 0), text_rect.inflate(20, 20))
+            pygame.draw.rect(screen, (255, 215, 0), text_rect.inflate(20, 20), 2)
+            screen.blit(text_surf, text_rect)
+
         pygame.display.flip()
         clock.tick(60) # El cliente corre a 60 FPS suavizado, aunque reciba 20 Ticks/s
+
+    # Avisa al servidor que nos vamos (LEAVE, 0x13) antes de cerrar
+    send_tcp_message(client_socket, 0x13, b'')
 
     pygame.quit()
     sys.exit()
@@ -180,7 +241,16 @@ def start_client():
                     continue
                 
                 elif msg_type == 0x22: # LOBBY_STATE
-                    print(" -> Actualización de sala recibida.")
+                    # Desempaqueta la lista completa en vez de solo avisar que llegó
+                    offset = 0
+                    state, count = struct.unpack_from('>BB', payload, offset)
+                    offset += 2
+                    print(f"\n--- JUGADORES EN LA SALA ({count}) ---")
+                    for _ in range(count):
+                        p_id = struct.unpack_from('>H', payload, offset)[0]
+                        offset += 2
+                        p_name, offset = unpack_str(payload, offset)
+                        print(f" -> P{p_id:02d}: {p_name}")
 
                 elif msg_type == 0x20: 
                     my_id = struct.unpack('>HH', payload)[0]    
@@ -203,8 +273,38 @@ def start_client():
                     game_config = {
                         'map_size': m_size / 100.0,
                         'circle_radius': c_rad / 100.0,
-                        'player_radius': p_rad / 100.0
+                        'player_radius': p_rad / 100.0,
+                        # Variables que antes se leían pero se descartaban
+                        'player_speed': p_speed / 100.0,
+                        'interaction_radius': int_rad / 100.0,
+                        'tick_interval_ms': tick
                     }
+
+                    # Lee el estado inicial de la bandera (u8 estado, u16 dueño, i32 X, i32 Y = 11 bytes)
+                    f_status, f_carrier, f_x, f_y = struct.unpack_from('>BHii', payload, offset)
+                    offset += 11
+                    game_config['flag'] = {
+                        'status': f_status, 'carrierId': f_carrier,
+                        'x': f_x / 100.0, 'y': f_y / 100.0
+                    }
+
+                    # Lee la lista de jugadores (id, nombre, posición, dirección, bandera)
+                    p_count = struct.unpack_from('>B', payload, offset)[0]
+                    offset += 1
+
+                    game_config['players'] = {}
+                    for _ in range(p_count):
+                        p_id = struct.unpack_from('>H', payload, offset)[0]
+                        offset += 2
+                        p_name, offset = unpack_str(payload, offset)
+                        p_x, p_y, p_dir, p_flag = struct.unpack_from('>iiBb', payload, offset)
+                        offset += 10
+
+                        game_config['players'][p_id] = {
+                            'name': p_name,
+                            'x': p_x / 100.0, 'y': p_y / 100.0,
+                            'direction': p_dir, 'hasFlag': bool(p_flag)
+                        }
 
                     print("\n¡Arrancando interfaz gráfica!")
                     run_game_loop(client_socket, my_id, game_config, )
